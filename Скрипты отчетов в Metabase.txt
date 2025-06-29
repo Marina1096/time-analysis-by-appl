@@ -1,0 +1,260 @@
+/* Причины отказов по последнему зафиксированному этапу заявки на дату snapshot_date */
+SELECT
+    /* Нормализуем «автоотклонения» и выводим текстовую причину */
+    CASE
+        WHEN s.comments LIKE 'Автоотклонение%' THEN 'Автоотклонение: скоринг < 30'
+        ELSE s.comments
+    END                                                AS refusal_reason,
+    COUNT(*)                                           AS applications_cnt
+FROM (
+    /* Последний этап каждой заявки на момент snapshot_date */
+    SELECT DISTINCT ON (credit.application_processing_log.application_id)
+           credit.application_processing_log.application_id,
+           credit.application_processing_log.stage_id,
+           credit.application_processing_log.stage_result_id,
+           credit.application_processing_log.comments
+    FROM credit.application_processing_log
+    WHERE credit.application_processing_log.start_date <= {{snapshot_date}}
+    ORDER BY credit.application_processing_log.application_id,
+             credit.application_processing_log.start_date DESC
+)                      s
+JOIN credit.stage_result_dict
+     ON credit.stage_result_dict.stage_result_id = s.stage_result_id
+JOIN credit.loan_applications
+     ON credit.loan_applications.application_id  = s.application_id
+JOIN credit.branch_dict
+     ON credit.branch_dict.branch_id             = credit.loan_applications.branch_id
+JOIN credit.manager_dict
+     ON credit.manager_dict.manager_id           = credit.loan_applications.manager_id
+WHERE credit.stage_result_dict.stage_result_name = 'отклонено'
+  AND s.stage_id IN (2,4)              -- учитываем два типа отказов
+  [[AND {{credit_type}}]]
+  [[AND {{branch_city}}]]
+  [[AND {{region_name}}]]
+  [[AND {{channel}}]]
+  [[AND {{application_date}}]]
+  [[AND {{manager_surname}}]]
+GROUP BY refusal_reason
+ORDER BY applications_cnt DESC;
+
+/* Процент заявок, чей полный цикл > 24 часов */
+SELECT
+    ROUND(
+        100.0 * SUM(CASE WHEN total_hours > 24 THEN 1 ELSE 0 END) / COUNT(*)
+    ,2)                                           AS violation_pct
+FROM (
+    SELECT
+        credit.loan_applications.application_id,
+        EXTRACT(EPOCH FROM (
+                COALESCE(MAX(credit.application_processing_log.end_date), {{snapshot_date}})
+                - MIN(credit.application_processing_log.start_date)
+        )) / 3600                                 AS total_hours
+    FROM credit.loan_applications
+    JOIN credit.application_processing_log
+         ON credit.application_processing_log.application_id = credit.loan_applications.application_id
+    JOIN credit.branch_dict
+         ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+    JOIN credit.manager_dict
+         ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+    WHERE credit.application_processing_log.start_date <= {{snapshot_date}}
+      [[AND {{credit_type}}]]
+      [[AND {{branch_city}}]]
+      [[AND {{region_name}}]]
+      [[AND {{channel}}]]
+      [[AND {{application_date}}]]
+      [[AND {{manager_surname}}]]
+    GROUP BY credit.loan_applications.application_id
+) t;
+
+/* Средняя длительность этапов (end_date – start_date) */
+SELECT
+    credit.stage_dict.stage_name                                                              AS stage,
+    ROUND(
+        AVG(
+            EXTRACT(EPOCH FROM (credit.application_processing_log.end_date
+                                - credit.application_processing_log.start_date))
+        ) / 3600 , 2)                                                                         AS avg_hours
+FROM credit.application_processing_log
+JOIN credit.stage_dict
+     ON credit.stage_dict.stage_id = credit.application_processing_log.stage_id
+JOIN credit.loan_applications
+     ON credit.loan_applications.application_id = credit.application_processing_log.application_id
+JOIN credit.branch_dict
+     ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+JOIN credit.manager_dict
+     ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+WHERE credit.application_processing_log.start_date <= {{snapshot_date}}
+  AND credit.application_processing_log.end_date   IS NOT NULL
+  AND credit.application_processing_log.end_date  <= {{snapshot_date}}
+  [[AND {{credit_type}}]]
+  [[AND {{branch_city}}]]
+  [[AND {{region_name}}]]
+  [[AND {{channel}}]]
+  [[AND {{application_date}}]]
+  [[AND {{manager_surname}}]]
+GROUP BY credit.stage_dict.stage_name
+ORDER BY case when credit.stage_dict.stage_name = 'Подача заявки' then 1
+			when credit.stage_dict.stage_name = 'Проверка документов' then 2
+			when credit.stage_dict.stage_name = 'Скоринг' then 3
+			else 4
+			end;
+
+/* Длительность обработки каждой заявки (часы) */
+SELECT
+    credit.loan_applications.application_id                              AS application_id,
+	credit.loan_applications.creation_date								 AS creation_date,
+    ROUND(
+        EXTRACT(EPOCH FROM (
+            COALESCE(MAX(credit.application_processing_log.end_date), {{snapshot_date}})
+            - MIN(credit.application_processing_log.start_date)
+        )) / 3600 , 2)                                                   AS duration_hours
+FROM credit.loan_applications
+JOIN credit.application_processing_log
+     ON credit.application_processing_log.application_id = credit.loan_applications.application_id
+JOIN credit.branch_dict
+     ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+JOIN credit.manager_dict
+     ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+WHERE credit.application_processing_log.start_date <= {{snapshot_date}}
+  [[AND {{credit_type}}]]
+  [[AND {{branch_city}}]]
+  [[AND {{region_name}}]]
+  [[AND {{channel}}]]
+  [[AND {{application_date}}]]
+  [[AND {{manager_surname}}]]
+GROUP BY credit.loan_applications.application_id, credit.loan_applications.creation_date
+order by 3 desc;
+
+/* Заявки, превысившие среднее время на этапе "Проверка документов" */
+SELECT
+    actual.application_id                              AS application_id,
+    actual.end_date                                  AS stage_end_date,
+    ROUND(actual.actual_hours - averages.avg_hours, 2) AS exceed_hours
+FROM (
+    /* Фактическая длительность каждого завершённого этапа "Проверка документов"*/
+    SELECT
+        credit.application_processing_log.application_id,
+        credit.application_processing_log.stage_id,
+        credit.application_processing_log.end_date,
+        EXTRACT(EPOCH FROM (
+            credit.application_processing_log.end_date
+            - credit.application_processing_log.start_date
+        )) / 3600                                       AS actual_hours
+    FROM credit.application_processing_log
+    JOIN credit.loan_applications
+         ON credit.loan_applications.application_id = credit.application_processing_log.application_id
+    JOIN credit.branch_dict
+         ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+    JOIN credit.manager_dict
+         ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+    WHERE credit.application_processing_log.stage_id IN (2)
+      AND credit.application_processing_log.start_date <= {{snapshot_date}}
+      AND credit.application_processing_log.end_date   IS NOT NULL
+      AND credit.application_processing_log.end_date  <= {{snapshot_date}}
+      [[AND {{credit_type}}]]
+      [[AND {{branch_city}}]]
+      [[AND {{region_name}}]]
+      [[AND {{channel}}]]
+      [[AND {{application_date}}]]
+      [[AND {{manager_surname}}]]
+) actual
+JOIN (
+    /* Средняя длительность по этапу "Проверка документов" */
+    SELECT
+        credit.application_processing_log.stage_id,
+        ROUND(
+            AVG(
+                EXTRACT(EPOCH FROM (
+                    credit.application_processing_log.end_date
+                    - credit.application_processing_log.start_date
+                )))/3600 , 2)                           AS avg_hours
+    FROM credit.application_processing_log
+    JOIN credit.loan_applications
+         ON credit.loan_applications.application_id = credit.application_processing_log.application_id
+    JOIN credit.branch_dict
+         ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+    JOIN credit.manager_dict
+         ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+    WHERE credit.application_processing_log.stage_id IN (2)
+      AND credit.application_processing_log.start_date <= {{snapshot_date}}
+      AND credit.application_processing_log.end_date   IS NOT NULL
+      AND credit.application_processing_log.end_date  <= {{snapshot_date}}
+      [[AND {{credit_type}}]]
+      [[AND {{branch_city}}]]
+      [[AND {{region_name}}]]
+      [[AND {{channel}}]]
+      [[AND {{application_date}}]]
+      [[AND {{manager_surname}}]]
+    GROUP BY credit.application_processing_log.stage_id
+) averages
+  ON averages.stage_id = actual.stage_id
+/* оставляем только превышения */
+WHERE actual.actual_hours > averages.avg_hours
+ORDER BY exceed_hours DESC;
+
+/* Заявки, превысившие среднее время на этапе "Принятие решения" */
+SELECT
+    actual.application_id                              AS application_id,
+    actual.end_date                                  AS stage_end_date,
+    ROUND(actual.actual_hours - averages.avg_hours, 2) AS exceed_hours
+FROM (
+    /* Фактическая длительность каждого завершённого этапа  "Принятие решения" */
+    SELECT
+        credit.application_processing_log.application_id,
+        credit.application_processing_log.stage_id,
+        credit.application_processing_log.end_date,
+        EXTRACT(EPOCH FROM (
+            credit.application_processing_log.end_date
+            - credit.application_processing_log.start_date
+        )) / 3600                                       AS actual_hours
+    FROM credit.application_processing_log
+    JOIN credit.loan_applications
+         ON credit.loan_applications.application_id = credit.application_processing_log.application_id
+    JOIN credit.branch_dict
+         ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+    JOIN credit.manager_dict
+         ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+    WHERE credit.application_processing_log.stage_id IN (4)
+      AND credit.application_processing_log.start_date <= {{snapshot_date}}
+      AND credit.application_processing_log.end_date   IS NOT NULL
+      AND credit.application_processing_log.end_date  <= {{snapshot_date}}
+      [[AND {{credit_type}}]]
+      [[AND {{branch_city}}]]
+      [[AND {{region_name}}]]
+      [[AND {{channel}}]]
+      [[AND {{application_date}}]]
+      [[AND {{manager_surname}}]]
+) actual
+JOIN (
+    /* Средняя длительность по этапу "Принятие решения" */
+    SELECT
+        credit.application_processing_log.stage_id,
+        ROUND(
+            AVG(
+                EXTRACT(EPOCH FROM (
+                    credit.application_processing_log.end_date
+                    - credit.application_processing_log.start_date
+                )))/3600 , 2)                           AS avg_hours
+    FROM credit.application_processing_log
+    JOIN credit.loan_applications
+         ON credit.loan_applications.application_id = credit.application_processing_log.application_id
+    JOIN credit.branch_dict
+         ON credit.branch_dict.branch_id            = credit.loan_applications.branch_id
+    JOIN credit.manager_dict
+         ON credit.manager_dict.manager_id          = credit.loan_applications.manager_id
+    WHERE credit.application_processing_log.stage_id IN (4)
+      AND credit.application_processing_log.start_date <= {{snapshot_date}}
+      AND credit.application_processing_log.end_date   IS NOT NULL
+      AND credit.application_processing_log.end_date  <= {{snapshot_date}}
+      [[AND {{credit_type}}]]
+      [[AND {{branch_city}}]]
+      [[AND {{region_name}}]]
+      [[AND {{channel}}]]
+      [[AND {{application_date}}]]
+      [[AND {{manager_surname}}]]
+    GROUP BY credit.application_processing_log.stage_id
+) averages
+  ON averages.stage_id = actual.stage_id
+/* оставляем только превышения */
+WHERE actual.actual_hours > averages.avg_hours
+ORDER BY exceed_hours DESC;
